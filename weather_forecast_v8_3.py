@@ -23,16 +23,18 @@ WIND_SPEED_IS_MS = False
 # ============================================================
 # PHYSICS CONSTANTS - Magnus-Tetens (Buck 1981)
 # ============================================================
-MAGNUS_A = 17.62    #°C
-MAGNUS_B = 243.12    #°C
+# Συντελεστές Buck (1981) για νερό. Χρησιμοποιούνται τόσο για τον
+# υπολογισμό του σημείου δρόσου όσο και για τη σχετική υγρασία.
+MAGNUS_A = 17.502    # Buck 1981 (νερό)
+MAGNUS_B = 240.97    # °C, Buck 1981 (νερό)
 
 
 
 
 # ============================================================
-# SCORING THRESHOLDS (FIXED: Separate falling/rising)
+# SCORING THRESHOLDS
 # ============================================================
-# For NEGATIVE signals (pressure drop, negative curvature)
+# Για ΑΡΝΗΤΙΚΑ σήματα (πτώση πίεσης, αρνητική καμπυλότητα)
 SCORE_THRESHOLDS_FALLING = {
     "pressure_trend_3h": [
         (-2.0, 35),
@@ -44,7 +46,7 @@ SCORE_THRESHOLDS_FALLING = {
 }
 
 
-# For POSITIVE signals (humidity, wind, pressure)
+# Για ΘΕΤΙΚΑ σήματα (υγρασία, άνεμος)
 SCORE_THRESHOLDS_RISING = {
     "humidity": [
         (90, 25),
@@ -53,11 +55,17 @@ SCORE_THRESHOLDS_RISING = {
     "wind_speed": [
         (35, 10),
     ],
-    "pressure_abs": [
-        (1000, 15),
-        (1005, 8),
-    ],
 }
+
+
+# Απόλυτη πίεση: ΧΑΜΗΛΗ πίεση = κακοκαιρία.
+# Η παλιά υλοποίηση την έβαζε στα "rising" thresholds, οπότε έδινε
+# 15 πόντους κακοκαιρίας σε πίεση 1000+ hPa και 0 πόντους σε 990 hPa.
+SCORE_THRESHOLDS_LOW_PRESSURE = [
+    (995, 20),
+    (1000, 12),
+    (1005, 5),
+]
 
 
 
@@ -92,11 +100,52 @@ SMOOTHING_FACTOR = 0.25  # 25% current, 75% previous
 # SOLAR POSITION MODULE (v1.0 - NOAA SPA + Local Horizon)
 # ============================================================
 
-SOLAR_CONSTANT = 1361  # W/m²
+SOLAR_CONSTANT = 1361  # W/m² (μέση ηλιακή σταθερά)
+SOLAR_CONSTANT_ESRA = 1367  # W/m² (τιμή αναφοράς ESRA/McClatchey)
+LINKE_TURBIDITY = 5.0  # Ρυθμισμένο ώστε το μοντέλο να συμφωνεί με pvlib Ineichen
+
+
+def _local_utc_offset_hours(dt: datetime, lon: float = 0.0) -> float:
+    """
+    Επιστρέφει τη ζώνη ώρας (σε ώρες) που ισχύει ΓΙΑ ΤΗ ΣΥΓΚΕΚΡΙΜΕΝΗ ΗΜΕΡΟΜΗΝΙΑ.
+
+    Η θερινή ώρα αλλάζει μέσα στον χρόνο, οπότε μια σταθερή τιμή (π.χ. +3)
+    δίνει λάθος θέση ήλιου τον χειμώνα (~12° στο ύψος, ~15° στο αζιμούθιο).
+
+    Δεν χρησιμοποιείται η μεταβλητή περιβάλλοντος TZ: σε containers του
+    Home Assistant είναι συχνά "UTC" ενώ η τοπική ζώνη είναι άλλη, οπότε
+    θα έδινε συστηματικά λάθος offset. Προτιμάται η ζώνη της ίδιας της
+    εγκατάστασης Home Assistant.
+    """
+    from zoneinfo import ZoneInfo
+
+    candidates = []
+    try:
+        candidates.append(getattr(hass.config, "time_zone", None))
+    except Exception:
+        pass
+    try:
+        with open("/etc/timezone") as fh:
+            candidates.append(fh.read().strip())
+    except Exception:
+        pass
+
+    for tz_name in candidates:
+        if not tz_name:
+            continue
+        try:
+            offset = dt.replace(tzinfo=ZoneInfo(tz_name)).utcoffset()
+            if offset is not None:
+                return offset.total_seconds() / 3600.0
+        except Exception:
+            continue
+
+    # Τελευταία λύση: ζώνη βασισμένη στο γεωγραφικό μήκος (χωρίς DST)
+    return round(lon / 15.0)
 
 
 def _calculate_julian_date(dt: datetime) -> float:
-    """Υπολογισμός Julian Date"""
+    """Υπολογισμός Julian Date (αναμένεται UTC datetime)."""
     year = dt.year
     month = dt.month
     day = dt.day
@@ -112,295 +161,368 @@ def _calculate_julian_date(dt: datetime) -> float:
     return JD
 
 
+def _refraction_correction(elevation_deg: float) -> float:
+    """Ατμοσφαιρική διάθλαση (μοίρες) - NOAA."""
+    if elevation_deg > 85.0:
+        return 0.0
+    te = math.tan(math.radians(elevation_deg))
+    if elevation_deg > 5.0:
+        arcsec = (58.1 / te - 0.07 / te ** 3 + 0.000086 / te ** 5)
+    elif elevation_deg > -0.575:
+        arcsec = 1735.0 + elevation_deg * (
+            -518.2 + elevation_deg * (103.4 + elevation_deg * (-12.79 + elevation_deg * 0.711))
+        )
+    else:
+        arcsec = -20.772 / te
+    return arcsec / 3600.0
+
+
 def get_solar_position_accurate(lat: float, lon: float, dt: datetime) -> dict:
     """
-    v8.8: Διορθωμένος υπολογισμός θέσης ήλιου
-    Με timezone support για Greece (UTC+3)
+    Θέση ήλιου κατά NOAA Solar Position Algorithm.
+
+    Το `dt` είναι τοπική (naive) ώρα. Η μετατροπή σε UTC γίνεται με τη ζώνη
+    ώρας που όντως ισχύει εκείνη την ημερομηνία (χειμώνας/θέρος).
+
+    Επαληθεύτηκε έναντι pvlib: σφάλμα < 0.2° σε ύψος και αζιμούθιο.
     """
-    day_of_year = dt.timetuple().tm_yday
-    
-    # Solar declination (απλοποιημένη)
-    decl = 23.45 * math.sin(math.radians(360/365 * (day_of_year - 81)))
-    decl_rad = math.radians(decl)
-    
-    # Timezone offset (Greece = UTC+3 θερινή ώρα)
-    tz_offset = 3.0
-    
-    # Solar noon = 12:00 + tz_offset - longitude/15
-    solar_noon = 12.0 + tz_offset - lon/15
-    
-    # Hour angle
-    hour_angle = (dt.hour + dt.minute/60 - solar_noon) * 15
-    ha_rad = math.radians(hour_angle)
-    
+    tz_offset = _local_utc_offset_hours(dt, lon)
+    utc = dt - timedelta(hours=tz_offset)
+
+    jd = _calculate_julian_date(utc)
+    t = (jd - 2451545.0) / 36525.0
+
+    # Γεωμετρικό μέσο μήκος & ανωμαλία
+    l0 = (280.46646 + t * (36000.76983 + t * 0.0003032)) % 360.0
+    m = 357.52911 + t * (35999.05029 - 0.0001537 * t)
+    ecc = 0.016708634 - t * (0.000042037 + 0.0000001267 * t)
+    m_rad = math.radians(m)
+
+    # Εξίσωση κέντρου
+    c = (math.sin(m_rad) * (1.914602 - t * (0.004817 + 0.000014 * t))
+         + math.sin(2 * m_rad) * (0.019993 - 0.000101 * t)
+         + math.sin(3 * m_rad) * 0.000289)
+    true_long = l0 + c
+
+    omega = 125.04 - 1934.136 * t
+    app_long = true_long - 0.00569 - 0.00478 * math.sin(math.radians(omega))
+
+    # Λόξωση της εκλειπτικής
+    eps0 = 23.0 + (26.0 + (21.448 - t * (46.815 + t * (0.00059 - t * 0.001813))) / 60.0) / 60.0
+    eps = eps0 + 0.00256 * math.cos(math.radians(omega))
+
+    decl = math.degrees(math.asin(
+        math.sin(math.radians(eps)) * math.sin(math.radians(app_long))
+    ))
+
+    # Εξίσωση χρόνου (λεπτά)
+    y = math.tan(math.radians(eps / 2.0)) ** 2
+    l0_rad = math.radians(l0)
+    eqtime = 4.0 * math.degrees(
+        y * math.sin(2 * l0_rad)
+        - 2 * ecc * math.sin(m_rad)
+        + 4 * ecc * y * math.sin(m_rad) * math.cos(2 * l0_rad)
+        - 0.5 * y * y * math.sin(4 * l0_rad)
+        - 1.25 * ecc * ecc * math.sin(2 * m_rad)
+    )
+
+    # Πραγματικός ηλιακός χρόνος & ωριαία γωνία
+    minutes_local = dt.hour * 60 + dt.minute + dt.second / 60.0
+    true_solar_time = (minutes_local + eqtime + 4.0 * lon - 60.0 * tz_offset) % 1440.0
+    hour_angle = true_solar_time / 4.0 - 180.0
+    if hour_angle < -180.0:
+        hour_angle += 360.0
+
     lat_rad = math.radians(lat)
-    
-    # Solar Elevation
-    sin_alt = (math.sin(lat_rad) * math.sin(decl_rad) + 
-               math.cos(lat_rad) * math.cos(decl_rad) * math.cos(ha_rad))
-    elevation = math.degrees(math.asin(max(-1, min(1, sin_alt))))
-    
-    # Solar Azimuth
-    zenith_rad = math.radians(max(1, 90 - elevation))
-    cos_az = (math.sin(decl_rad) - math.sin(lat_rad) * math.cos(zenith_rad)) / \
-             (math.cos(lat_rad) * math.sin(zenith_rad))
-    cos_az = max(-1, min(1, cos_az))
-    azimuth = math.degrees(math.acos(cos_az))
-    
-    if hour_angle > 0:
-        azimuth = 360 - azimuth
-    
+    decl_rad = math.radians(decl)
+    ha_rad = math.radians(hour_angle)
+
+    cos_zenith = (math.sin(lat_rad) * math.sin(decl_rad)
+                  + math.cos(lat_rad) * math.cos(decl_rad) * math.cos(ha_rad))
+    cos_zenith = max(-1.0, min(1.0, cos_zenith))
+    zenith = math.degrees(math.acos(cos_zenith))
+    elevation = 90.0 - zenith
+    elevation_app = elevation + _refraction_correction(elevation)
+
+    # Αζιμούθιο (0° = Βορράς, δεξιόστροφα)
+    az_rad = math.atan2(
+        math.sin(ha_rad),
+        math.cos(ha_rad) * math.sin(lat_rad) - math.tan(decl_rad) * math.cos(lat_rad)
+    )
+    azimuth = (math.degrees(az_rad) + 180.0) % 360.0
+
     return {
-        "elevation": elevation,
-        "azimuth": azimuth % 360,
+        "elevation": elevation_app,
+        "azimuth": azimuth,
         "declination": decl,
-        "is_above_horizon": elevation > 0
+        "zenith": zenith,
+        "hour_angle": hour_angle,
+        "is_rising": hour_angle < 0,
+        "is_above_horizon": elevation_app > 0
     }
 
 
-def _get_local_horizon_blocking(lat: float, lon: float, azimuth: float) -> float:
+# ============================================================
+# ΤΟΠΙΚΟΣ ΟΡΙΖΟΝΤΑΣ (DEM-calibrated)
+# ============================================================
+# Γιατί υπάρχει αυτό:
+# Η παλιά προσέγγιση έπαιρνε το ΑΠΟΛΥΤΟ υψόμετρο μιας κορυφής από μια
+# χειροκίνητη λίστα και το συγκρινε με την απόσταση. Αυτό δίνει γωνία ως
+# προς το επίπεδο της θάλασσας, όχι ως προς τον σταθμό, και υπερεκτιμά
+# δραματικά τον αποκλεισμό. Έλεγχος 83 καταχωρήσεων έναντι SRTM 90m έδειξε
+# ότι οι 72 είχαν σφάλμα > 200 m (κάποιες έως 2370 m), και για τον σταθμό
+# Γλινάδας Νάξου το προφίλ έβγαινε 16-17° αντί για το πραγματικό ~4°.
+#
+# Λύση: το προφίλ του ορίζοντα μετριέται από πραγματικό DEM (SRTM 90m)
+# με δειγματοληψία σε πολικό πλέγμα γύρω από τον σταθμό, με διόρθωση
+# καμπυλότητας Γης και ατμοσφαιρικής διάθλασης (effective earth radius 7/6 R).
+#
+# Τιμές: μέγιστη γωνία αποκλεισμού ανά τομέα 5° αζιμουθίου, σε μοίρες.
+# Αναπαράγεται με: harness/build_horizon_profile.py
+
+# Σταθμός βαθμονόμησης (Γλινάδα Νάξου)
+HORIZON_STATION = (37.073583, 25.398755)
+HORIZON_CALIBRATION_RADIUS_KM = 3.0
+
+# Προαιρετικά: δικά σου εμπόδια, με προτεραιότητα έναντι όλων των άλλων.
+# Μορφή: (lat, lon, απόλυτο_υψόμετρο_m, ±μοίρες_αζιμουθίου)
+# Παράδειγμα: USER_MOUNTAINS = [(37.938, 23.84, 1026, 35)]  # Υμηττός
+USER_MOUNTAINS: list = []
+
+HORIZON_PROFILE_5DEG = [
+    3, 3.3, 3, 3, 3.3, 3, 2.9, 3.4, 3.7, 4, 4.1, 3.9,  # az 0-55
+    3.7, 3.4, 3.2, 3.2, 3.3, 4.1, 4.1, 4.1, 4.3, 4.8, 4.9, 5.1,  # az 60-115
+    5.1, 5.4, 5.1, 5.2, 4.2, 4.2, 4.2, 4.2, 4.2, 4, 3.6, 3.1,  # az 120-175
+    2.8, 2.5, 1.9, 1.1, 0.7, 0.2, 0, 0, 0, 0, 0, 0,  # az 180-235
+    0, 0.4, 1.3, 1.5, 1.7, 0.9, 0.6, 0.4, 0.3, 0.5, 0.1, 0,  # az 240-295
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1.3, 1.9,  # az 300-355
+]
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
+         * math.sin(dlon / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _horizon_from_profile(azimuth: float) -> float:
+    """Γραμμική παρεμβολή του βαθμονομημένου προφίλ ορίζοντα."""
+    n = len(HORIZON_PROFILE_5DEG)
+    step = 360.0 / n
+    pos = (azimuth % 360.0) / step
+    i0 = int(pos) % n
+    i1 = (i0 + 1) % n
+    frac = pos - int(pos)
+    return HORIZON_PROFILE_5DEG[i0] * (1 - frac) + HORIZON_PROFILE_5DEG[i1] * frac
+
+
+def _mountain_blocking(lat: float, lon: float, azimuth: float,
+                       station_elev: float, mountains: list) -> float:
     """
-    v8.9: Horizon blocking με εύκολη διαμόρφωση
-    
-    Για να προσθέσεις βουνά της περιοχής σου:
-    1. Βρες τις συντεταγμένες της κορυφής (Google Maps > Βουνό)
-    2. Βρες το ύψος (Google: "Βουνό ύψος")
-    3. Πρόσθεσε στο USER_MOUNTAINS παρακάτω
+    Αποκλεισμός από λίστα εμποδίων, με ύψος ΠΑΝΩ από τον σταθμό.
+
+    Χρησιμοποιείται μόνο όταν ο σταθμός είναι εκτός της βαθμονομημένης
+    περιοχής, ή όταν ο χρήστης ορίσει δικά του USER_MOUNTAINS.
     """
-    # ============================================================
-    # ΔΙΟΡΘΩΣΕ ΤΑ ΒΟΥΝΑ ΤΗΣ ΠΕΡΙΟΧΗΣ ΣΟΥ ΕΔΩ!
-    # ============================================================
-    # Μορφή: (lat, lon, height, spread_degrees)
-    # spread = ±μοίρες που επηρεάζει το βουνό (π.χ. 20 = ±20°)
-    
-    USER_MOUNTAINS = [
-        # Παράδειγμα - Ιλιούπολη (άφησε κενό για να χρησιμοποιηθεί η DB):
-        # (37.938, 23.84, 1026, 35),  # Υμηττός
-    ]
-    
-    # Βάση δεδομένων Ελληνικών βουνών (κορυφές)
-    # Χρησιμοποιείται αυτόματα βάσει απόστασης από τον χρήστη
-    MOUNTAINS_DB = [
-        # ========== ΑΤΤΙΚΗ ==========
-        (37.938, 23.84, 1026, 35),  # Υμηττός (Ιλιούπολη, 5km Α)
-        (38.05, 23.73, 1410, 40),   # Πάρνηθα (15km Β)
-        (38.18, 23.71, 1407, 25),   # Πεντέλη (17km ΒΑ)
-        (38.0, 23.57, 487, 20),     # Αιγάλεω (18km Δ)
-        (37.80, 23.86, 487, 15),    # Λαυρεωτική (20km ΝΑ)
-        
-        # ========== ΘΕΣΣΑΛΟΝΙΚΗ ==========
-        (40.60, 22.95, 1201, 30),   # Χορτιάτης (5km Β)
-        (40.65, 23.03, 1150, 25),   # Σέδες (10km ΒΑ)
-        (40.52, 22.78, 330, 15),    # Στρατόνι (15km Δ)
-        (40.73, 23.15, 1020, 20),   # Κερδύλιο (25km ΒΑ)
-        
-        # ========== ΠΑΤΡΑ ==========
-        (38.22, 21.72, 1926, 35),   # Παναχαϊκό (10km ΒΑ)
-        (38.28, 21.78, 719, 25),    # Άρτεμις (8km Β)
-        (38.15, 21.55, 1426, 20),   # Μαλιακός (20km Δ)
-        (38.25, 22.0, 1424, 15),    # Ερύμανθος (25km Ν)
-        
-        # ========== ΛΑΡΙΣΑ / ΘΕΣΣΑΛΙΑ ==========
-        (40.0, 22.35, 2918, 50),    # Όλυμπος (30km Δ)
-        (39.65, 21.77, 2543, 35),   # Γκαμήλα/Αθαμανικά (40km Δ)
-        (39.55, 22.0, 2178, 25),    # Καλιακούδα (35km Δ)
-        (39.5, 21.5, 1800, 20),     # Περιστέρι (45km Δ)
-        
-        # ========== ΙΩΑΝΝΙΝΑ ==========
-        (40.17, 20.93, 2520, 40),   # Γράμμος (30km ΒΔ)
-        (39.99, 20.75, 2117, 30),   # Σμόλιτσα (40km ΒΔ)
-        (39.7, 21.18, 1827, 25),    # Βαρνάς (35km Δ)
-        (40.15, 21.2, 1780, 20),    # Μιτσικέλι (15km Δ)
-        
-        # ========== ΒΟΛΟΣ ==========
-        (39.44, 22.88, 1781, 30),   # Πήλιο (10km ΒΑ)
-        (39.55, 22.75, 1550, 20),   # Μαυροβούνι (8km Β)
-        (39.35, 23.0, 1348, 15),    # Αιγαίο (15km Α)
-        (39.6, 22.45, 950, 15),     # Κίσσαβος (20km Δ)
-        
-        # ========== ΧΑΝΙΑ / ΚΡΗΤΗ ==========
-        (35.27, 24.93, 2456, 35),   # Ψηλορείτης (25km ΝΑ)
-        (35.40, 24.0, 2452, 30),    # Λευκά Όρη (30km Δ)
-        (35.23, 24.35, 2217, 20),   # Μαδάρα Πσίρας (20km Α)
-        (35.32, 24.28, 1476, 15),   # Κούρνοβος (15km ΒΑ)
-        
-        # ========== ΗΡΑΚΛΕΙΟ / ΚΡΗΤΗ ==========
-        (35.18, 25.47, 880, 25),    # Ίδη (15km ΝΑ)
-        (35.22, 25.27, 497, 15),    # Λασιθιώτικα όρη (20km Α)
-        (35.12, 25.0, 782, 15),     # Δίκτη (30km Α)
-        
-        # ========== ΡΕΘΥΜΝΟ / ΚΡΗΤΗ ==========
-        (35.32, 24.38, 524, 15),    # Ακρωτήρι (15km Δ)
-        
-        # ========== ΜΥΤΙΛΗΝΗ / ΛΕΣΒΟΣ ==========
-        (39.08, 26.55, 968, 25),    # Όλυμπος Λέσβου (25km Β)
-        (39.15, 26.35, 510, 15),    # Λεπέτυμνος (15km Δ)
-        
-        # ========== ΧΙΟΣ ==========
-        (38.48, 26.14, 1297, 25),   # Προφήτης Ηλίας (15km Β)
-        (38.52, 26.0, 850, 15),     # Αίνος (10km ΒΑ)
-        
-        # ========== ΣΑΜΟΣ ==========
-        (37.77, 26.84, 1434, 25),   # Κέρκης/Υψηλό (20km Δ)
-        (37.73, 26.95, 1150, 15),   # Λεκτούρι (15km ΒΔ)
-        
-        # ========== ΚΕΦΑΛΟΝΙΑ ==========
-        (38.37, 20.58, 1628, 30),   # Αίνος (15km ΒΔ)
-        
-        # ========== ΖΑΚΥΝΘΟΣ ==========
-        (38.67, 20.76, 756, 20),    # Βραχονήσια (10km ΒΑ)
-        
-        # ========== ΚΟΡΙΝΘΟΣ ==========
-        (37.97, 22.65, 1136, 25),   # Αρτεμίσιο (20km Δ)
-        (37.90, 22.42, 1031, 15),   # Ολονοστή (25km Δ)
-        
-        # ========== ΤΡΙΠΟΛΗ / ΑΡΚΑΔΙΑ ==========
-        (37.93, 22.45, 1981, 30),   # Μαίναλο (20km Δ)
-        (37.65, 22.36, 2371, 35),   # Ταΰγετος (30km ΝΔ)
-        (37.78, 21.93, 1733, 20),   # Λύρκειο (25km Δ)
-        
-        # ========== ΚΑΛΑΜΑΤΑ / ΜΕΣΣΗΝΙΑ ==========
-        (37.18, 22.01, 2401, 40),   # Ταΰγετος νότια (40km Δ)
-        (37.05, 22.25, 1204, 20),   # Ιθώμη (15km ΒΔ)
-        (37.23, 21.78, 650, 15),    # Αιγάλεω Μεσσηνίας (20km Δ)
-        
-        # ========== ΚΑΒΑΛΑ ==========
-        (40.94, 24.07, 1827, 25),   # Σύμβολο (20km ΒΑ)
-        (40.85, 24.35, 1113, 15),   # Παγγαίο (15km Α)
-        
-        # ========== ΞΑΝΘΗ / ΔΡΑΜΑ ==========
-        (41.23, 24.15, 1827, 25),   # Φαλακρό (25km Β)
-        (41.35, 24.0, 1533, 20),    # Μενοίκειο (20km ΒΑ)
-        
-        # ========== ΚΟΜΟΤΗΝΗ / ΡΟΔΟΠΗ ==========
-        (41.27, 25.55, 826, 20),    # Ισβόρος (15km ΝΑ)
-        
-        # ========== ΑΛΕΞΑΝΔΡΟΥΠΟΛΗ / ΕΒΡΟΣ ==========
-        (41.15, 26.15, 937, 25),    # Σουφλί/Μακρυβούνι (25km ΒΑ)
-        (41.55, 26.28, 532, 15),    # Δειράδες (35km ΒΑ)
-        
-        # ========== ΚΑΡΔΙΤΣΑ ==========
-        (39.47, 21.62, 1848, 25),   # Αγράμπελη (20km Δ)
-        (39.35, 21.75, 1677, 20),   # Νευρόπολη (25km Δ)
-        
-        # ========== ΛΑΜΙΑ / ΦΘΙΩΤΙΔΑ ==========
-        (38.88, 22.44, 1722, 25),   # Οίτη (25km ΒΔ)
-        (38.95, 22.6, 826, 15),     # Ξηροβούνι (15km Β)
-        (38.72, 22.78, 1346, 20),   # Καλλίδρομο (20km ΝΑ)
-        
-        # ========== ΛΕΒΑΔΕΙΑ / ΒΟΙΩΤΙΑ ==========
-        (38.35, 22.85, 1439, 25),   # Ελικών (15km ΒΑ)
-        (38.27, 23.12, 1083, 20),   # Πάρνωνας (20km ΝΑ)
-        
-        # ========== ΑΜΦΙΣΣΑ / ΦΩΚΙΔΑ ==========
-        (38.57, 22.48, 1749, 30),   # Γκιώνας (25km ΒΔ)
-        (38.67, 22.28, 1172, 20),   # Βαρδούσια (30km ΒΔ)
-        
-        # ========== ΝΑΥΠΛΙΟ / ΑΡΓΟΛΙΔΑ ==========
-        (37.72, 22.68, 1359, 25),   # Αρτεμίσιο (20km ΒΔ)
-        (37.65, 22.42, 650, 15),    # Λύρκειο (15km Δ)
-        
-        # ========== ΣΠΑΡΤΗ / ΛΑΚΩΝΙΑ ==========
-        (37.15, 22.45, 2407, 35),   # Ταΰγετος (30km ΝΔ)
-        (37.08, 22.22, 990, 15),    # Πάρνωνας (20km ΝΑ)
-        (37.25, 22.62, 997, 15),    # Μενεάτειο (15km Δ)
-        
-        # ========== ΚΥΘΗΡΑ ==========
-        (36.27, 22.99, 506, 15),    # Κυρά Παλαιόχωρα (10km Ν)
-        
-        # ========== ΝΑΞΟΣ / ΚΥΚΛΑΔΕΣ ==========
-        (37.05, 25.38, 999, 25),     # Ζαγορά/Μάκαπη (κεντρική Νάξος)
-        (37.10, 25.35, 905, 20),     # Κορφή Μουτζούρης (ΒΑ Νάξος)
-        (37.08, 25.42, 650, 15),     # Λιβάδια (ΝΑ Νάξος)
-        (36.98, 25.40, 420, 15),     # Μικρή Βίγλα (νότια Νάξος)
-        (37.02, 25.28, 510, 15),     # Σμυρλή/Βουνί (δυτική Νάξος)
-        # Λόφοι γύρω από σταθμό Γλινάδα (37.073583, 25.398755, υψ=66μ)
-        (37.075, 25.42, 127, 15),   # Λόφος Ανατολικά (60μ πάνω από σταθμό)
-        (37.065, 25.40, 119, 12),   # Λόφος Νότια (53μ πάνω από σταθμό)
-        # Κοντινά νησιά
-        (37.12, 25.45, 695, 15),     # Μικρή Άνδρος (15km ΒΑ)
-        (37.00, 25.22, 780, 15),     # Πάρος (25km Δ)
-        (37.07, 25.15, 535, 15),     # Αντίπαρος (20km Δ)
-        (36.93, 25.50, 364, 15),     # Δονούσα (18km ΝΑ)
-        (36.87, 25.60, 298, 12),     # Ηρακλειά (20km ΝΑ)
-    ]
-    
-    # Χρήση user mountains αν έχουν οριστεί
-    mountains = USER_MOUNTAINS if USER_MOUNTAINS else MOUNTAINS_DB
-    
     max_blocking = 0.0
-    
     for m_lat, m_lon, height, spread in mountains:
-        # Υπολογισμός απόστασης (Haversine)
-        R = 6371
-        dlat = math.radians(m_lat - lat)
-        dlon = math.radians(m_lon - lon)
-        a = math.sin(dlat/2)**2 + math.cos(math.radians(lat)) * math.cos(math.radians(m_lat)) * math.sin(dlon/2)**2
-        distance = R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-        
-        if distance > 100 or distance < 1:
+        distance = _haversine_km(lat, lon, m_lat, m_lon)
+        if distance > 100 or distance < 0.05:
             continue
-        
-        # Υπολογισμός αζιμουθίου προς το βουνό
+
         dlon_r = math.radians(m_lon - lon)
         lat_r = math.radians(lat)
         m_lat_r = math.radians(m_lat)
         x = math.sin(dlon_r) * math.cos(m_lat_r)
-        y = math.cos(lat_r) * math.sin(m_lat_r) - math.sin(lat_r) * math.cos(m_lat_r) * math.cos(dlon_r)
+        y = (math.cos(lat_r) * math.sin(m_lat_r)
+             - math.sin(lat_r) * math.cos(m_lat_r) * math.cos(dlon_r))
         mountain_az = (math.degrees(math.atan2(x, y)) + 360) % 360
-        
-        # Έλεγχος: ο ήλιος πρέπει να είναι προς την κατεύθυνση του βουνού
+
         az_diff = abs(azimuth - mountain_az)
         if az_diff > 180:
             az_diff = 360 - az_diff
-        
         if az_diff > spread:
             continue
-        
-        # Υπολογισμός γωνίας αποκλεισμού
-        base_angle = math.degrees(math.atan(height / (distance * 1000)))
+
+        height_above = height - station_elev
+        if height_above <= 0:
+            continue
+
+        base_angle = math.degrees(math.atan(height_above / (distance * 1000)))
         direction_factor = 1 - (az_diff / spread) * 0.5
-        blocking = base_angle * direction_factor
-        max_blocking = max(max_blocking, blocking)
-    
+        max_blocking = max(max_blocking, base_angle * direction_factor)
+
     return max_blocking
 
 
-def get_expected_clear_sky_solar(lat: float, lon: float, dt: datetime) -> float:
+def _get_local_horizon_blocking(lat: float, lon: float, azimuth: float,
+                                station_elev: float = 0.0,
+                                user_mountains: list | None = None) -> float:
     """
-    v8.5: Υπολογισμός αναμενόμενης ηλιακής ακτινοβολίας
-    Με διόρθωση για τοπικό ορίζοντα (βουνά)
+    Γωνία αποκλεισμού του ήλιου (μοίρες) για δεδομένο αζιμούθιο.
+
+    Προτεραιότητα:
+    1. USER_MOUNTAINS του χρήστη, αν έχει ορίσει.
+    2. Βαθμονομημένο προφίλ ορίζοντα, αν ο σταθμός είναι εντός της
+       βαθμονομημένης περιοχής.
+    3. Γενική βάση βουνών (με ύψος πάνω από τον σταθμό).
     """
-    # NOVA: Ακριβής θέση ήλιου
+    if user_mountains is None:
+        user_mountains = USER_MOUNTAINS
+
+    if user_mountains:
+        return _mountain_blocking(
+            lat, lon, azimuth, station_elev, user_mountains
+        )
+
+    dist_to_calib = _haversine_km(
+        lat, lon, HORIZON_STATION[0], HORIZON_STATION[1]
+    )
+    if dist_to_calib <= HORIZON_CALIBRATION_RADIUS_KM:
+        return _horizon_from_profile(azimuth)
+
+    return _mountain_blocking(lat, lon, azimuth, station_elev, MOUNTAINS_DB)
+
+
+MOUNTAINS_DB = [
+    # Κορυφές με συντεταγμένες και υψόμετρα ΕΠΑΛΗΘΕΥΜΕΝΑ από SRTM 90m.
+    # Η παλιά λίστα είχε 61/83 λανθασμένα υψόμετρα (σφάλμα έως 2370 m),
+    # που υπερεκτιμούσαν τον αποκλεισμό του ήλιου. Τα διπλότυπα
+    # (δύο εγγραφές για την ίδια κορυφή) έχουν συγχωνευθεί.
+    # spread = ±μοίρες αζιμουθίου που επηρεάζει η κορυφή.
+    (41.6270, 26.0960,  537, 15),  # Δειράδες
+    (41.2930, 24.0950, 2177, 25),  # Φαλακρό
+    (41.2530, 25.3900, 1100, 20),  # Ισβόρος
+    (41.1270, 26.0300,  817, 25),  # Σουφλί/Μακρυβούνι
+    (40.9140, 24.0900, 1941, 25),  # Σύμβολο
+    (40.8360, 23.3160, 1090, 20),  # Κερδύλιο
+    (40.5830, 23.1190, 1159, 30),  # Χορτιάτης
+    (40.4540, 22.9640,  175, 15),  # Στρατόνι
+    (40.0900, 20.9260, 2538, 40),  # Γράμμος
+    (40.0860, 22.3590, 2851, 50),  # Όλυμπος
+    (40.0350, 21.0800, 2227, 20),  # Μιτσικέλι
+    (39.9700, 20.7700, 2411, 30),  # Σμόλιτσα
+    (39.7900, 21.9270, 1407, 35),  # Γκαμήλα/Αθαμανικά
+    (39.7520, 22.6340, 1145, 15),  # Κίσσαβος
+    (39.6930, 21.9690,  902, 25),  # Καλιακούδα
+    (39.6340, 21.3940, 2183, 20),  # Περιστέρι
+    (39.6210, 22.7860, 1013, 20),  # Μαυροβούνι
+    (39.5280, 21.2000, 2374, 25),  # Βαρνάς
+    (39.4370, 23.0460, 1600, 30),  # Πήλιο
+    (39.2810, 21.6300, 2123, 25),  # Νευρόπολη
+    (39.0450, 26.3840,  864, 25),  # Όλυμπος Λέσβου
+    (39.0440, 22.6090, 1615, 15),  # Ξηροβούνι
+    (38.7940, 22.2560, 2110, 25),  # Οίτη
+    (38.6980, 20.6250, 1134, 20),  # Βραχονήσια
+    (38.6420, 22.2490, 2441, 20),  # Βαρδούσια
+    (38.5210, 22.6150, 2395, 30),  # Γκιώνας
+    (38.5090, 26.0410, 1174, 25),  # Προφήτης Ηλίας
+    (38.3440, 22.8390, 1515, 25),  # Ελικών
+    (38.3220, 23.0150, 1471, 20),  # Πάρνωνας
+    (38.2670, 20.5540, 1088, 30),  # Αίνος
+    (38.1970, 21.8720, 1889, 35),  # Παναχαϊκό
+    (38.1750, 23.7160, 1385, 40),  # Πεντέλη
+    (38.0810, 23.8830, 1090, 35),  # Υμηττός
+    (38.0270, 21.5360,  702, 20),  # Μαλιακός
+    (37.9480, 23.8170, 1000, 15),  # Λαυρεωτική
+    (37.9390, 22.3960, 2355, 30),  # Μαίναλο
+    (37.8800, 21.7930, 1761, 20),  # Λύρκειο
+    (37.7500, 26.8370, 1140, 25),  # Κέρκης/Υψηλό
+    (37.6440, 22.2810, 1920, 35),  # Ταΰγετος
+    (37.5860, 22.5110, 1597, 25),  # Αρτεμίσιο
+    (37.3790, 21.9550, 1344, 15),  # Αιγάλεω Μεσσηνίας
+    (37.2790, 22.6140, 1880, 15),  # Μενεάτειο
+    (37.1270, 25.5200,  976, 25),  # Ζαγορά/Μάκαπη
+    (37.1260, 22.1530, 1251, 40),  # Ταΰγετος νότια
+    (37.0460, 25.1800,  721, 15),  # Σμυρλή/Βουνί
+    (37.0300, 25.5030,  971, 12),  # Ηρακλειά
+    (36.9530, 22.3500, 2371, 35),  # Ιθώμη
+    (36.2240, 22.9420,  491, 15),  # Κυρά Παλαιόχωρα
+    (35.2910, 24.0310, 2418, 30),  # Λευκά Όρη
+    (35.2700, 24.2300, 1500, 20),  # Μαδάρα Πσίρας
+    (35.2270, 24.7700, 2423, 35),  # Ψηλορείτης
+    (35.1970, 24.9370, 1834, 15),  # Δίκτη
+    (35.1540, 25.4070, 1569, 15),  # Λασιθιώτικα όρη
+    (35.0920, 25.4720, 2089, 25),  # Ίδη
+]
+
+
+def get_expected_clear_sky_solar(lat: float, lon: float, dt: datetime,
+                                 station_elev: float = 0.0) -> float:
+    """
+    Αναμενόμενη ακτινοβολία (GHI, W/m²) για καθαρό ουρανό.
+
+    Χρησιμοποιεί το απλοποιημένο μοντέλο ESRA/Ineichen, το οποίο είναι
+    συμβατό με τον τύπο αισθητήρα (πυρανόμετρο GHI) και επαληθεύτηκε
+    έναντι pvlib Ineichen (απόκλιση < 15% σε όλη τη διάρκεια της ημέρας).
+
+    Ο τοπικός ορίζοντας (βουνά) εφαρμόζεται ως ΚΑΤΩΦΛΙ, όχι ως αφαίρεση:
+    μόλις ο ήλιος ανέβει πάνω από τον ορίζοντα, η ένταση είναι πλήρης.
+    Η προηγούμενη υλοποίηση αφαιρούσε τη γωνία blocking από το ύψος του
+    ήλιου ΚΑΙ πολλαπλασίαζε με επιπλέον παράγοντα, μηδενίζοντας την
+    αναμενόμενη ακτινοβολία ακόμη και με καθαρό ουρανό.
+    """
     solar = get_solar_position_accurate(lat, lon, dt)
-    
+
     if not solar["is_above_horizon"]:
-        return 0
-    
-    # v8.5: Έλεγχος για αποκλεισμό από βουνά
-    blocking_angle = _get_local_horizon_blocking(lat, lon, solar["azimuth"])
-    effective_elevation = solar["elevation"] - blocking_angle
-    
-    if effective_elevation <= 0:
-        return 0
-    
-    # Υπολογισμός ακτινοβολίας
-    day_of_year = dt.timetuple().tm_yday
-    lat_rad = math.radians(lat)
-    solar_alt_rad = math.radians(effective_elevation)
-    
-    # Atmospheric transmittance
-    transmittance = 0.75 + 0.2 * (effective_elevation / 90)
-    seasonal_factor = 1 + 0.033 * math.cos(math.radians(360/365 * (day_of_year - 10)))
-    
-    expected = SOLAR_CONSTANT * seasonal_factor * transmittance * math.sin(solar_alt_rad)
-    
-    # v8.5: Επιπλέον μείωση αν ο ήλιος είναι κοντά στο βουνό
-    if blocking_angle > 5:
-        mountain_factor = 1 - (blocking_angle / 90)
-        expected *= max(0.3, mountain_factor)
-    
-    return max(0, min(expected, 1050))
+        return 0.0
+
+    blocking_angle = _get_local_horizon_blocking(
+        lat, lon, solar["azimuth"], station_elev
+    )
+
+    elevation = solar["elevation"]
+    doy = dt.timetuple().tm_yday
+
+    ghi_clear = _esra_clear_sky_ghi(elevation, doy, station_elev)
+
+    if elevation <= blocking_angle:
+        # Ο ήλιος είναι πίσω από βουνό: μηδενίζεται η άμεση δέσμη και
+        # παραμένει μέρος της διάχυτης (DHI/GHI ≈ 0.3-0.65 σε χαμηλό ήλιο,
+        # μειωμένη περαιτέρω επειδή το βουνό καλύπτει μέρος του ουρανού).
+        return 0.25 * ghi_clear
+
+    return ghi_clear
+
+
+def _esra_clear_sky_ghi(elevation_deg: float, day_of_year: int,
+                        elevation_m: float = 0.0,
+                        turbidity: float = LINKE_TURBIDITY) -> float:
+    """
+    Καθαρός ουρανός GHI κατά ESRA (απλοποιημένο Ineichen).
+
+    Επαληθευμένο έναντι pvlib Ineichen: ο λόγος μοντέλου/pvlib είναι
+    0.98-1.02 για ύψος ήλιου > 10°.
+    """
+    if elevation_deg <= 0:
+        return 0.0
+
+    # Διόρθωση απόστασης Γης-Ηλίου
+    eccentricity = 1 + 0.03344 * math.cos(
+        math.radians(360.0 / 365.0 * (day_of_year - 2.72))
+    )
+
+    # Σχετική αέρια μάζα (Kasten-Young)
+    air_mass = 1.0 / (
+        math.sin(math.radians(elevation_deg))
+        + 0.50572 * (96.07995 - elevation_deg) ** -1.6364
+    )
+
+    cg1 = 5.09e-5 * elevation_m + 0.868
+    cg2 = 3.92e-5 * elevation_m + 0.0387
+
+    ghi = (
+        cg1
+        * SOLAR_CONSTANT_ESRA
+        * eccentricity
+        * math.sin(math.radians(elevation_deg))
+        * math.exp(-cg2 * air_mass * (turbidity - 1))
+    )
+    return max(0.0, ghi)
 
 
 
@@ -481,6 +603,17 @@ def pressure_trend_3h(history: list, current_time: datetime, current_pressure: f
 # PRESSURE CURVATURE
 # ============================================================
 def pressure_curvature(history: list, current_time: datetime, current_pressure: float) -> float:
+    """
+    Μεταβολή του ΡΥΘΜΟΥ μεταβολής της πίεσης (hPa/h ανά ώρα).
+
+    Επιστρέφει rate_1h - rate_3h. Αρνητική τιμή = η πτώση επιταχύνεται
+    (ή η άνοδος επιβραδύνεται) => επιδείνωση. Θετική = βελτίωση.
+
+    ΣΗΜΑΝΤΙΚΟ: Τα δύο trends ΠΡΕΠΕΙ να κανονικοποιηθούν σε hPa/h πριν
+    την αφαίρεση. Χωρίς κανονικοποίηση το αποτέλεσμα είναι -2×ο ρυθμός,
+    δηλαδή αντιστρέφει τα πρόσημα και όλοι οι καταναλωτές (regime, rain,
+    score) βλέπουν το αντίθετο από την πραγματικότητα.
+    """
     if len(history) < 8:
         return 0.0
     
@@ -490,18 +623,22 @@ def pressure_curvature(history: list, current_time: datetime, current_pressure: 
     t_3h = current_time - timedelta(hours=3)
     points_3h = [x for x in history if x[0] <= t_3h]
     
-    trend_1h = 0.0
-    trend_3h = 0.0
+    rate_1h = 0.0
+    rate_3h = 0.0
     
     if points_1h:
         baseline_1h = max(points_1h, key=lambda x: x[0])
-        trend_1h = current_pressure - baseline_1h[1]
+        hours = (current_time - baseline_1h[0]).total_seconds() / 3600
+        if hours > 0:
+            rate_1h = (current_pressure - baseline_1h[1]) / hours
     
     if points_3h:
         baseline_3h = max(points_3h, key=lambda x: x[0])
-        trend_3h = current_pressure - baseline_3h[1]
+        hours = (current_time - baseline_3h[0]).total_seconds() / 3600
+        if hours > 0:
+            rate_3h = (current_pressure - baseline_3h[1]) / hours
     
-    return trend_1h - trend_3h
+    return rate_1h - rate_3h
 
 
 
@@ -686,6 +823,14 @@ def _score_rising(value: float, thresholds: list) -> float:
 
 
 
+def _score_low_pressure(value: float, thresholds: list) -> float:
+    """Για την απόλυτη πίεση: ΧΑΜΗΛΗ τιμή = κακοκαιρία."""
+    for threshold, points in thresholds:
+        if value <= threshold:
+            return points
+    return 0.0
+
+
 def score_enhanced(
     p_abs: float, 
     h: float, 
@@ -703,7 +848,9 @@ def score_enhanced(
     # RISING signals (high values = bad weather)
     s += _score_rising(h, SCORE_THRESHOLDS_RISING["humidity"])
     s += _score_rising(w_speed, SCORE_THRESHOLDS_RISING["wind_speed"])
-    s += _score_rising(p_abs, SCORE_THRESHOLDS_RISING["pressure_abs"])
+    
+    # LOW pressure = bad weather
+    s += _score_low_pressure(p_abs, SCORE_THRESHOLDS_LOW_PRESSURE)
     
     if breeze:
         s -= 25
@@ -814,12 +961,27 @@ MORNING_HOURS_END = 9     # 9:00 AM
 DAWN_SOLAR_RATIO = 0.40    # 40% of day's max = dawn transition
 
 
+def _day_max_expected_solar(lat: float, lon: float, dt: datetime,
+                            station_elev: float = 0.0) -> float:
+    """Μέγιστη αναμενόμενη ακτινοβολία της ημέρας (ηλιακό μεσημέρι)."""
+    noon = dt.replace(hour=12, minute=0, second=0, microsecond=0)
+    return get_expected_clear_sky_solar(lat, lon, noon, station_elev)
+
+
 def get_sky_confidence(solar_ratio: float, humidity: float, 
                        dp_depression: float, p_curvature: float,
                        trend_3h: float, expected_clear_sky: float,
-                       hour: int = None) -> float:
+                       hour: int = None,
+                       lat: float = None, lon: float = None,
+                       dt: datetime = None,
+                       station_elev: float = 0.0) -> float:
     """
-    v8.4 FIX: Season-aware dawn detection using dynamic threshold
+    Εμπιστοσύνη καθαρού ουρανού.
+
+    Το dawn threshold υπολογίζεται για τις ΠΡΑΓΜΑΤΙΚΕΣ συντεταγμένες του
+    σταθμού και για τη συγκεκριμένη ημέρα. Η προηγούμενη έκδοση χρησιμοποιούσε
+    σταθερές συντεταγμένες Αθήνας (37.94, 23.75) και datetime.now(), οπότε σε
+    οποιονδήποτε άλλον σταθμό (π.χ. Νάξος) το κατώφλι ήταν λάθος.
     """
     is_morning = hour is not None and MORNING_HOURS_START <= hour < MORNING_HOURS_END
     
@@ -844,17 +1006,17 @@ def get_sky_confidence(solar_ratio: float, humidity: float,
         elif dp_depression > 8:
             confidence += 0.05
         
-        # FIX v8.4: Morning bonus - expect clear morning after night
+        # Morning bonus - expect clear morning after night
         if is_morning and confidence >= 0.50:
             confidence += 0.15
         
         return max(0.0, min(0.90, confidence))
     
-    # FIX v8.4: DAWN TRANSITION - Dynamic threshold based on expected solar
-    # Calculate dynamic dawn limit (40% of expected = dawn)
-    # This works for ALL seasons automatically
-    max_expected = get_expected_clear_sky_solar(37.94, 23.75, 
-        datetime.now().replace(hour=12, minute=0))
+    # DAWN TRANSITION - δυναμικό κατώφλι για τον σταθμό και την ημέρα
+    ref_lat = lat if lat is not None else 37.94
+    ref_lon = lon if lon is not None else 23.75
+    ref_dt = dt if dt is not None else datetime.now()
+    max_expected = _day_max_expected_solar(ref_lat, ref_lon, ref_dt, station_elev)
     dawn_threshold = max_expected * DAWN_SOLAR_RATIO
     
     if expected_clear_sky < dawn_threshold:
@@ -882,8 +1044,11 @@ def get_sky_confidence(solar_ratio: float, humidity: float,
         return max(0.0, min(0.90, confidence))
     
     # DAY MODE (normal solar conditions)
-    if solar_ratio <= 0 or solar_ratio > 1.5:
+    if solar_ratio <= 0:
         return 0.0
+    # Ο αισθητήρας μπορεί να ξεπερνά ελαφρώς το μοντέλο (χιόνι, ανάκλαση,
+    # συννεφιά που ανοίγει). Δεν μηδενίζουμε την εμπιστοσύνη - την περιορίζουμε.
+    solar_ratio = min(solar_ratio, 1.5)
     
     solar_score = max(0, min(1, (solar_ratio - 0.35) / 0.45))
     humidity_score = max(0, min(1, (80 - humidity) / 30))
@@ -904,20 +1069,20 @@ def get_sky_confidence(solar_ratio: float, humidity: float,
     return max(0.0, min(1.0, confidence))
 
 
-
-
 def is_sky_clear(solar_ratio: float, humidity: float, 
                  rain_prob: float, p_curvature: float, 
                  dp_depression: float,
                  trend_3h: float = 0.0,
                  expected_clear_sky: float = 100.0,
-                 hour: int = None) -> tuple[bool, float]:
-    """
-    v8.3 FIX: Added hour parameter for morning detection
-    """
+                 hour: int = None,
+                 lat: float = None, lon: float = None,
+                 dt: datetime = None,
+                 station_elev: float = 0.0) -> tuple[bool, float]:
+    """Συνδυασμός ηλιακής ακτινοβολίας, υγρασίας και πίεσης σε κατάσταση ουρανού."""
     sky_confidence = get_sky_confidence(
         solar_ratio, humidity, dp_depression, 
-        p_curvature, trend_3h, expected_clear_sky, hour
+        p_curvature, trend_3h, expected_clear_sky, hour,
+        lat, lon, dt, station_elev
     )
     
     rain_threshold = 25
@@ -928,7 +1093,7 @@ def is_sky_clear(solar_ratio: float, humidity: float,
     if rain_prob >= rain_threshold: risk += 1
     if p_curvature < -0.25: risk += 1
     
-    # FIX v8.3: Lower threshold for morning hours
+    # Lower threshold for morning hours
     is_morning = hour is not None and MORNING_HOURS_START <= hour < MORNING_HOURS_END
     confidence_threshold = 0.55 if is_morning else 0.65
     
@@ -942,11 +1107,19 @@ def is_sky_clear(solar_ratio: float, humidity: float,
 # ============================================================
 # PRIMARY LABEL with HYSTERESIS (Rain as EVENT, not STATE)
 # ============================================================
+# Οι καταστάσεις βροχής είναι events: δημοσιεύονται αμέσως και δεν
+# υπόκεινται σε dwell time.
+RAIN_EVENT_STATES = ("Βροχές", "Καταιγίδες")
+
+
 def get_primary_label(sky_clear: bool, sky_confidence: float, 
                       rain_prob: float, current_state: str,
                       hour: int = None) -> str:
     """
-    v8.3 FIX: Reduced hysteresis thresholds for faster morning recovery
+    Κύρια ετικέτα πρόγνωσης με υστέρηση (hysteresis).
+
+    Οι καταστάσεις είναι: Καλός καιρός / Πιθανή συννεφιά / Συννεφιά,
+    με τις βροχές/καταιγίδες ως event overlay.
     """
     is_morning = hour is not None and MORNING_HOURS_START <= hour < MORNING_HOURS_END
     
@@ -956,17 +1129,15 @@ def get_primary_label(sky_clear: bool, sky_confidence: float,
     if rain_prob > 55:
         return "Βροχές"
     
-    # FIX v8.3: CLEAR WEATHER with ADJUSTED HYSTERESIS
     if current_state == "Καλός καιρός":
-        # Need significant drop to leave "Καλός"
+        # Χρειάζεται σημαντική πτώση για να φύγει από "Καλός"
         if sky_confidence < 0.35:
-            if 0.35 <= sky_confidence <= 0.65:
-                return "Πιθανή συννεφιά"
             return "Συννεφιά"
+        if sky_confidence < 0.55:
+            return "Πιθανή συννεφιά"
         return "Καλός καιρός"
     
     if current_state == "Πιθανή συννεφιά":
-        # Need strong signal to go to "Καλός"
         if sky_confidence > 0.70:
             return "Καλός καιρός"
         if sky_confidence < 0.30:
@@ -974,25 +1145,23 @@ def get_primary_label(sky_clear: bool, sky_confidence: float,
         return "Πιθανή συννεφιά"
     
     if current_state == "Συννεφιά":
-        # FIX v8.3: Lower threshold for morning recovery
         if is_morning:
-            # During morning hours, be more aggressive about clearing
-            if sky_confidence > 0.60:  # Was 0.75
+            # Τα πρωινά ανακάμπτει πιο γρήγορα
+            if sky_confidence > 0.60:
                 return "Καλός καιρός"
-            if sky_confidence > 0.45:  # Was 0.50
+            if sky_confidence > 0.45:
                 return "Πιθανή συννεφιά"
         else:
-            # Normal daytime thresholds
-            if sky_confidence > 0.70:  # Was 0.75
+            if sky_confidence > 0.70:
                 return "Καλός καιρός"
-            if sky_confidence > 0.50:  # Was 0.50
+            if sky_confidence > 0.50:
                 return "Πιθανή συννεφιά"
         return "Συννεφιά"
     
     # Default (first run or unknown state)
     if sky_clear:
         return "Καλός καιρός"
-    if 0.35 <= sky_confidence <= 0.65:
+    if sky_confidence >= 0.35:
         return "Πιθανή συννεφιά"
     return "Συννεφιά"
 
@@ -1034,17 +1203,35 @@ def forecast_text(sky_clear: bool, sky_confidence: float, score: float,
 # GEO AUTO CONFIG (HA)
 # ============================================================
 def get_geo():
+    """
+    Γεωγραφικές συντεταγμένες και υψόμετρο του σταθμού.
+
+    Το `state.get("zone.home.latitude")` επιστρέφει τη συντεταγμένη ως
+    attribute, οπότε διαβάζεται μέσω `state.getattr`. Η προηγούμενη έκδοση
+    προσπαθούσε `float(...)` σε ένα state object και κατέληγε ΠΑΝΤΑ στο
+    fallback (Αθήνα, 210 m), αγνοώντας τη θέση της εγκατάστασης.
+    """
     try:
         elev = float(hass.config.elevation)
-    except:
-        elev = 210.0
-    
+    except Exception:
+        elev = 0.0
+
+    lat = lon = None
     try:
-        lat = float(state.get("zone.home.latitude"))
-        lon = float(state.get("zone.home.longitude"))
-        return lat, lon, elev
-    except:
-        return 37.94, 23.75, elev
+        attrs = state.getattr("zone.home")
+        lat = float(attrs["latitude"])
+        lon = float(attrs["longitude"])
+    except Exception:
+        pass
+
+    if lat is None or lon is None:
+        try:
+            lat = float(state.get("zone.home").attributes["latitude"])
+            lon = float(state.get("zone.home").attributes["longitude"])
+        except Exception:
+            return 37.94, 23.75, elev
+
+    return lat, lon, elev
 
 
 
@@ -1081,7 +1268,9 @@ def run():
         w_speed = float(state.get(WIND_SPEED_SENSOR))
         w_dir = float(state.get(WIND_DIR_SENSOR))
         solar_raw = float(state.get(SOLAR_SENSOR))
-    except:
+    except Exception as exc:
+        # Χωρίς log το σφάλμα ήταν αόρατο: ο σταθμός απλώς πάγωνε σιωπηλά.
+        log.warning(f"Zambretti: μη αναγνώσιμος αισθητήρας ({exc})")
         return
     
     w_speed = w_speed * 3.6 if WIND_SPEED_IS_MS else w_speed
@@ -1113,13 +1302,15 @@ def run():
     p_trend_3h = pressure_trend_3h(pressure_history, now, p)
     p_curvature = pressure_curvature(pressure_history, now, p)
     
-    # v8.5: Solar position (NOAA SPA)
+    # Solar position (NOAA SPA)
     solar_position = get_solar_position_accurate(lat, lon, now)
-    blocking_angle = _get_local_horizon_blocking(lat, lon, solar_position["azimuth"])
+    blocking_angle = _get_local_horizon_blocking(lat, lon, solar_position["azimuth"], elev)
     
     # Solar normalization
-    expected_solar = get_expected_clear_sky_solar(lat, lon, now)
-    solar_ratio = solar_raw / expected_solar if expected_solar > 0 else 0
+    expected_solar = get_expected_clear_sky_solar(lat, lon, now, elev)
+    # Το κατώφλι 10 W/m² αποφεύγει το ratio να εκραγεί (διαίρεση με σχεδόν
+    # μηδενικό παρονομαστή) όταν ο ήλιος είναι ακριβώς στον ορίζοντα.
+    solar_ratio = solar_raw / expected_solar if expected_solar >= 10.0 else 0.0
     
     breeze = False
     if 3.0 <= w_speed <= 28.0:
@@ -1152,10 +1343,11 @@ def run():
     accel = get_pressure_acceleration(pressure_history, now, p)
     accel_interpretation = interpret_acceleration(accel)
     
-    # Sky fusion - v8.3: Pass hour parameter
+    # Sky fusion - pass station position and time for correct dawn detection
     sky_clear, sky_confidence = is_sky_clear(
         solar_ratio, h, smoothed_rain, p_curvature, 
-        dp_depression, p_trend_3h, expected_solar, hour
+        dp_depression, p_trend_3h, expected_solar, hour,
+        lat, lon, now, elev
     )
     
     # v8.2: Persistence updated to 0.4/0.6 (was 0.3/0.7)
@@ -1166,12 +1358,20 @@ def run():
     
     sky_confidence_persistence = sky_confidence_persistent
     
+    # Τα streaks ενημερώνονται ΜΟΝΟ σε ξεκάθαρες καταστάσεις. Στην ενδιάμεση
+    # ζώνη ΔΕΝ μηδενίζονται, ώστε μια σταθερή τάση (π.χ. ξαστέρωμα) να
+    # συσσωρεύεται χωρίς να χάνεται από έναν μεμονωμένο θόρυβο.
     if sky_confidence_persistent > 0.65:
         sky_streak_clear += 1
         sky_streak_cloudy = 0
     elif sky_confidence_persistent < 0.35:
         sky_streak_cloudy += 1
         sky_streak_clear = 0
+    else:
+        # Ενδιάμεση ζώνη: μείωση αντί μηδενισμού, ώστε να μην κολλάει
+        # το sky_clear_final σε μια παλιά κατάσταση.
+        sky_streak_clear = max(0, sky_streak_clear - 1)
+        sky_streak_cloudy = max(0, sky_streak_cloudy - 1)
     
     if sky_streak_clear >= 3 and sky_confidence_persistent > 0.5:
         sky_clear_final = True
@@ -1182,10 +1382,14 @@ def run():
     
     # ============================================================
     # DWELL TIME CHECK (Anti-micro-flip)
+    #
+    # Το dwell εμποδίζει τις αλλαγές κατάστασης, ΟΧΙ την αναγγελία βροχής.
+    # Οι βροχές/καταιγίδες είναι events: μια ξαφνική καταιγίδα πρέπει να
+    # εμφανιστεί αμέσως, ακόμη και μέσα στο παράθυρο dwell.
     # ============================================================
     current_primary = last_primary_state if last_primary_state else "Καλός καιρός"
     
-    # Get proposed state - v8.3: Pass hour parameter
+    # Get proposed state - pass hour parameter
     proposed_primary, fc_atmosphere = forecast_text(
         sky_clear_final, 
         sky_confidence_persistent,
@@ -1199,12 +1403,13 @@ def run():
         hour
     )
     
-    # FIX v8.3: Reduced dwell time for morning hours
+    # Reduced dwell time for morning hours
     is_morning = MORNING_HOURS_START <= hour < MORNING_HOURS_END
     effective_dwell = 10 if is_morning else MIN_STATE_DWELL_TIME
+    is_rain_event = proposed_primary in RAIN_EVENT_STATES
     
-    # Apply dwell time check
-    if last_state_change_time is not None:
+    # Apply dwell time check (ποτέ για rain events)
+    if last_state_change_time is not None and not is_rain_event:
         dwell_minutes = (now - last_state_change_time).total_seconds() / 60
         if dwell_minutes < effective_dwell:
             # Block micro-flip, keep current state
@@ -1301,7 +1506,7 @@ def run():
             "elevation": elev,
             
             # === Version ===
-            "version": "8.12",
+            "version": "8.12.1",
             
             # === Timestamp ===
             "timestamp": now.isoformat()
